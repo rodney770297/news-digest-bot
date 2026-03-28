@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 CHAT_ID     = os.getenv("CHAT_ID",   "")
 TIMEZONE    = os.getenv("TIMEZONE",  "Asia/Kuala_Lumpur")
-MAX_STORIES = int(os.getenv("MAX_STORIES", "5"))
+MAX_STORIES = int(os.getenv("MAX_STORIES", "2"))
 MAX_MSG_LEN = 4000
 
 # ── Sentiment Engine ──────────────────────────────────────────────────────────────────
@@ -278,6 +278,22 @@ async def deliver(bot, chat_id: str, category_key: str) -> None:
     await push(bot, chat_id, build_message(category_key))
 
 
+def build_combined_digest(header: str = "", include_market: bool = True) -> str:
+    """Build a single digest string with all categories (2 stories each)."""
+    tz   = pytz.timezone(TIMEZONE)
+    date = datetime.now(tz).strftime("%A, %d %B %Y")
+
+    parts = [header or f"🌅 <b>Daily News Digest</b>\n📅 {date}"]
+
+    if include_market:
+        parts.append(get_market_snapshot())
+
+    for key in CATEGORIES:
+        parts.append(build_message(key))
+
+    return "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(parts)
+
+
 # ── Command Handlers ───────────────────────────────────────────────────────────────────────
 
 HELP_TEXT = (
@@ -347,13 +363,7 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
     loader  = await update.message.reply_text("⏳ Compiling full digest…")
-    tz      = pytz.timezone(TIMEZONE)
-    date    = datetime.now(tz).strftime("%A, %d %B %Y")
-    await push(ctx.bot, chat_id, f"🌅 <b>Daily News Digest</b>\n📅 {date}")
-    await push(ctx.bot, chat_id, get_market_snapshot())
-    for key in CATEGORIES:
-        await deliver(ctx.bot, chat_id, key)
-        await asyncio.sleep(0.4)
+    await push(ctx.bot, chat_id, build_combined_digest(include_market=True))
     try:
         await loader.delete()
     except Exception:
@@ -364,19 +374,13 @@ async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def daily_digest(app: Application) -> None:
     logger.info("Running daily digest…")
-    tz   = pytz.timezone(TIMEZONE)
-    date = datetime.now(tz).strftime("%A, %d %B %Y")
-    await push(app.bot, CHAT_ID, f"🌅 <b>Good Morning, Rodney! Your Daily Digest</b>\n📅 {date}")
     try:
-        await push(app.bot, CHAT_ID, get_market_snapshot())
+        tz   = pytz.timezone(TIMEZONE)
+        date = datetime.now(tz).strftime("%A, %d %B %Y")
+        header = f"🌅 <b>Good Morning, Rodney! Your Daily Digest</b>\n📅 {date}"
+        await push(app.bot, CHAT_ID, build_combined_digest(header=header, include_market=True))
     except Exception as exc:
-        logger.error("Market snapshot failed: %s", exc)
-    for key in CATEGORIES:
-        try:
-            await deliver(app.bot, CHAT_ID, key)
-            await asyncio.sleep(1)
-        except Exception as exc:
-            logger.error("Category %s failed: %s", key, exc)
+        logger.error("Daily digest failed: %s", exc)
 
 
 # ── Scheduled: Breaking News every 30 min ───────────────────────────────────────────────────
