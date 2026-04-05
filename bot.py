@@ -578,20 +578,73 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+def build_all_message(prefs: dict) -> tuple:
+    """
+    Single consolidated /all digest.
+    Shows 1 story per category until MIN_RATINGS reached, then 2.
+    Returns (text, keyboard) — keyboard covers every shown story.
+    """
+    tz    = pytz.timezone(TIMEZONE)
+    date  = datetime.now(tz).strftime("%A, %d %B %Y")
+    total = prefs.get("total_ratings", 0)
+    n     = 2 if total >= MIN_RATINGS else 1
+
+    if total < MIN_RATINGS:
+        remaining = MIN_RATINGS - total
+        pref_hint = (
+            f"\n<i>🎯 Rate {remaining} more stor"
+            f"{'y' if remaining == 1 else 'ies'} to unlock personalisation</i>"
+        )
+    else:
+        pref_hint = "\n<i>🎯 Personalised for you</i>"
+
+    lines: list       = [f"🌅 <b>Top Headlines — {date}</b>", ""]
+    all_stories: list = []   # flat list — drives keyboard numbering
+
+    for key, cat in CATEGORIES.items():
+        stories = fetch_stories(cat["feeds"])
+        stories = rank_stories(stories, key, prefs)
+        cache_stories(stories, key, prefs)
+        top = stories[:n]
+        if not top:
+            continue
+
+        lines.append(f"{cat['emoji']} <b>{cat['title']}</b>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        for s in top:
+            idx = len(all_stories)
+            num = NUM_EMOJI[idx] if idx < len(NUM_EMOJI) else f"{idx + 1}."
+            block = f"{s['sentiment']} {num} <b>{s['title']}</b>\n<i>{s['source']}</i>"
+            if s["summary"]:
+                block += f" — {s['summary']}"
+            if s["link"]:
+                block += f'\n<a href="{s["link"]}">Read more →</a>'
+            lines.append(block)
+            all_stories.append(s)
+
+        lines.append("")
+
+    if not all_stories:
+        return "⚠️ No stories available right now. Try again shortly.", None
+
+    lines.append(pref_hint)
+    lines.append("<i>Rate stories below 👇</i>")
+
+    text     = "\n".join(lines).strip()
+    keyboard = build_rating_keyboard(all_stories)
+    return text, keyboard
+
+
 async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
-    loader  = await update.message.reply_text("⏳ Compiling full digest…")
-    tz      = pytz.timezone(TIMEZONE)
-    date    = datetime.now(tz).strftime("%A, %d %B %Y")
+    loader  = await update.message.reply_text("⏳ Compiling digest…")
     prefs   = load_prefs()
 
-    await push(ctx.bot, chat_id, f"🌅 <b>Daily News Digest</b>\n📅 {date}")
-    await push(ctx.bot, chat_id, get_market_snapshot())
-    for key in CATEGORIES:
-        await deliver(ctx.bot, chat_id, key, prefs)
-        await asyncio.sleep(0.4)
-
+    text, keyboard = build_all_message(prefs)
     save_prefs(prefs)
+
+    await push(ctx.bot, chat_id, text, keyboard)
     try:
         await loader.delete()
     except Exception:
