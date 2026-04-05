@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily News Digest Bot v2
-━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━
 What's new:
   - Sentiment per story  : 📈 Bullish · 📉 Bearish · ⚖️ Neutral  (VADER)
   - Market snapshot      : KLCI, USD/MYR, BTC, S&P 500, Gold  (/market)
@@ -25,21 +25,21 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# ── Logging ────────────────────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 CHAT_ID     = os.getenv("CHAT_ID",   "")
 TIMEZONE    = os.getenv("TIMEZONE",  "Asia/Kuala_Lumpur")
-MAX_STORIES = int(os.getenv("MAX_STORIES", "2"))
+MAX_STORIES = int(os.getenv("MAX_STORIES", "5"))
 MAX_MSG_LEN = 4000
 
-# ── Sentiment Engine ──────────────────────────────────────────────────────────────────
+# ── Sentiment Engine ───────────────────────────────────────────────────────────
 _sia = SentimentIntensityAnalyzer()
 
 def sentiment_emoji(text: str) -> str:
@@ -51,7 +51,7 @@ def sentiment_emoji(text: str) -> str:
         return "📉"
     return "⚖️"
 
-# ── RSS Sources ──────────────────────────────────────────────────────────────────────────
+# ── RSS Sources ────────────────────────────────────────────────────────────────
 CATEGORIES = {
     "world": {
         "emoji": "🌍", "title": "WORLD NEWS",
@@ -97,21 +97,34 @@ CATEGORIES = {
 
 NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
 
-# ── Breaking News: keywords that warrant an immediate alert ──────────────────────
-BREAKING_KEYWORDS = {
-    "breaking", "urgent", "alert", "crash", "collapse", "bankrupt",
-    "surge", "plunge", "soar", "emergency", "crisis", "resign", "fired",
-    "war", "attack", "explosion", "arrest", "ban", "sanction", "recall",
-    "ipo", "merger", "acquisition", "rate cut", "rate hike", "default",
-    "shutdown", "hack", "breach", "fraud", "scandal",
+# ── Breaking News: Tier 1 = always alert · Tier 2 = only if strong sentiment ──
+BREAKING_TIER1 = {
+    # Unambiguously serious — fire regardless of sentiment score
+    "breaking", "urgent", "alert",
+    "crash", "collapse", "bankrupt", "default",
+    "emergency", "crisis",
+    "war", "attack", "explosion",
+    "hack", "breach", "fraud", "scandal",
+    "shutdown",
 }
+BREAKING_TIER2_WORDS = {
+    # Common in everyday finance/biz news — only fire if VADER |compound| ≥ 0.4
+    "merger", "acquisition", "ipo",
+    "plunge", "surge", "soar",
+    "resign", "fired", "arrest", "sanction",
+}
+BREAKING_TIER2_PHRASES = {"rate cut", "rate hike"}
 
-# ── Breaking News State ──────────────────────────────────────────────────────────────────
+MAX_DAILY_ALERTS = 5   # hard cap per calendar day (MYT)
+
+# ── Breaking News State ────────────────────────────────────────────────────────
 _seen_links: set = set()
 _breaking_initialized: bool = False
+_daily_alert_count: int = 0
+_daily_alert_date: str = ""
 
 
-# ── Text Helpers ─────────────────────────────────────────────────────────────────────
+# ── Text Helpers ───────────────────────────────────────────────────────────────
 
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text).strip()
@@ -128,17 +141,27 @@ def clean_summary(raw: str, max_chars: int = 280) -> str:
     sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'\u201c])", text)
     summary = " ".join(sentences[:2]).strip()
     if len(summary) > max_chars:
-        summary = summary[:max_chars].rsplit(" ", 1)[0] + "\u2026"
+        summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
     return summary
 
 
-def is_breaking(title: str) -> bool:
-    """True if the headline contains any high-signal keyword."""
-    words = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
-    return bool(words & BREAKING_KEYWORDS)
+def is_breaking(title: str, compound: float = 0.0) -> bool:
+    """
+    Tier 1 keywords trigger an alert unconditionally.
+    Tier 2 keywords only trigger if VADER |compound| >= 0.4
+    (i.e. the story is genuinely emotionally charged, not routine).
+    """
+    words   = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
+    t_lower = title.lower()
+    if words & BREAKING_TIER1:
+        return True
+    has_t2 = bool(words & BREAKING_TIER2_WORDS) or any(
+        p in t_lower for p in BREAKING_TIER2_PHRASES
+    )
+    return has_t2 and abs(compound) >= 0.4
 
 
-# ── Feed Fetching ──────────────────────────────────────────────────────────────────────────
+# ── Feed Fetching ──────────────────────────────────────────────────────────────
 
 def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
     """
@@ -168,9 +191,14 @@ def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
                 if not raw or len(strip_html(raw)) < 60:
                     raw = entry.get("summary") or entry.get("description") or ""
 
-                summary   = clean_summary(raw)
-                link      = entry.get("link", "")
-                sentiment = sentiment_emoji(title + " " + summary)
+                summary  = clean_summary(raw)
+                link     = entry.get("link", "")
+                compound = _sia.polarity_scores(title + " " + summary)["compound"]
+                sentiment = (
+                    "📈" if compound >= 0.05 else
+                    "📉" if compound <= -0.05 else
+                    "⚖️"
+                )
 
                 all_stories.append({
                     "source":    source,
@@ -178,8 +206,9 @@ def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
                     "summary":   html.escape(summary),
                     "link":      link,
                     "sentiment": sentiment,
-                    "raw_title": title,   # unescaped, for keyword check
-                    "raw_link":  link,    # unescaped, for dedup
+                    "compound":  compound,  # raw VADER score for breaking-news gate
+                    "raw_title": title,     # unescaped, for keyword check
+                    "raw_link":  link,      # unescaped, for dedup
                 })
         except Exception as exc:
             logger.warning("Feed error [%s | %s]: %s", source, url, exc)
@@ -187,7 +216,7 @@ def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
     return all_stories[:limit]
 
 
-# ── Market Snapshot ──────────────────────────────────────────────────────────────────────────
+# ── Market Snapshot ────────────────────────────────────────────────────────────
 
 MARKET_TICKERS = [
     ("🇲🇾 KLCI",   "^KLSE",   "{:,.2f}",  " pts"),
@@ -205,12 +234,9 @@ def get_market_snapshot() -> str:
 
     for label, ticker, fmt, unit in MARKET_TICKERS:
         try:
-            hist = yf.Ticker(ticker).history(period="5d")
-            if hist.empty or len(hist) < 2:
-                lines.append(f"⚪ <b>{label}</b>: N/A")
-                continue
-            price = float(hist["Close"].iloc[-1])
-            prev  = float(hist["Close"].iloc[-2])
+            fi    = yf.Ticker(ticker).fast_info
+            price = fi.last_price
+            prev  = fi.previous_close
             if price and prev and prev != 0:
                 pct   = ((price - prev) / prev) * 100
                 arrow = "🟢" if pct >= 0 else "🔴"
@@ -227,7 +253,7 @@ def get_market_snapshot() -> str:
     return "\n".join(lines)
 
 
-# ── Message Building ───────────────────────────────────────────────────────────────────────
+# ── Message Building ───────────────────────────────────────────────────────────
 
 def build_message(category_key: str) -> str:
     cat     = CATEGORIES[category_key]
@@ -261,7 +287,7 @@ def build_message(category_key: str) -> str:
     return "\n".join(lines).strip()
 
 
-# ── Telegram Push ──────────────────────────────────────────────────────────────────────────
+# ── Telegram Push ──────────────────────────────────────────────────────────────
 
 async def push(bot, chat_id: str, text: str) -> None:
     """Send a message, splitting recursively if > MAX_MSG_LEN."""
@@ -281,23 +307,7 @@ async def deliver(bot, chat_id: str, category_key: str) -> None:
     await push(bot, chat_id, build_message(category_key))
 
 
-def build_combined_digest(header: str = "", include_market: bool = True) -> str:
-    """Build a single digest string with all categories (2 stories each)."""
-    tz   = pytz.timezone(TIMEZONE)
-    date = datetime.now(tz).strftime("%A, %d %B %Y")
-
-    parts = [header or f"🌅 <b>Daily News Digest</b>\n📅 {date}"]
-
-    if include_market:
-        parts.append(get_market_snapshot())
-
-    for key in CATEGORIES:
-        parts.append(build_message(key))
-
-    return "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(parts)
-
-
-# ── Command Handlers ───────────────────────────────────────────────────────────────────────
+# ── Command Handlers ───────────────────────────────────────────────────────────
 
 HELP_TEXT = (
     "👋 <b>Daily News Digest Bot v2</b>\n\n"
@@ -366,35 +376,56 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
     loader  = await update.message.reply_text("⏳ Compiling full digest…")
-    await push(ctx.bot, chat_id, build_combined_digest(include_market=True))
+    tz      = pytz.timezone(TIMEZONE)
+    date    = datetime.now(tz).strftime("%A, %d %B %Y")
+    await push(ctx.bot, chat_id, f"🌅 <b>Daily News Digest</b>\n📅 {date}")
+    await push(ctx.bot, chat_id, get_market_snapshot())
+    for key in CATEGORIES:
+        await deliver(ctx.bot, chat_id, key)
+        await asyncio.sleep(0.4)
     try:
         await loader.delete()
     except Exception:
         pass
 
 
-# ── Scheduled: Daily Digest at 8 AM ─────────────────────────────────────────────────────
+# ── Scheduled: Daily Digest at 8 AM ───────────────────────────────────────────
 
 async def daily_digest(app: Application) -> None:
     logger.info("Running daily digest…")
+    tz   = pytz.timezone(TIMEZONE)
+    date = datetime.now(tz).strftime("%A, %d %B %Y")
+    await push(app.bot, CHAT_ID, f"🌅 <b>Good Morning, Rodney! Your Daily Digest</b>\n📅 {date}")
     try:
-        tz   = pytz.timezone(TIMEZONE)
-        date = datetime.now(tz).strftime("%A, %d %B %Y")
-        header = f"🌅 <b>Good Morning, Rodney! Your Daily Digest</b>\n📅 {date}"
-        await push(app.bot, CHAT_ID, build_combined_digest(header=header, include_market=True))
+        await push(app.bot, CHAT_ID, get_market_snapshot())
     except Exception as exc:
-        logger.error("Daily digest failed: %s", exc)
+        logger.error("Market snapshot failed: %s", exc)
+    for key in CATEGORIES:
+        try:
+            await deliver(app.bot, CHAT_ID, key)
+            await asyncio.sleep(1)
+        except Exception as exc:
+            logger.error("Category %s failed: %s", key, exc)
 
 
-# ── Scheduled: Breaking News every 30 min ───────────────────────────────────────────────────
+# ── Scheduled: Breaking News every 30 min ─────────────────────────────────────
 
 async def check_breaking_news(app: Application) -> None:
     """
-    Runs every 30 minutes. On the first run, it only populates _seen_links
-    (no alerts sent). Afterwards, any new story whose headline contains a
-    high-signal keyword triggers an immediate Telegram alert.
+    Runs every 30 minutes.
+    - First run: populates _seen_links only (no alerts).
+    - Subsequent runs: alerts only for stories that pass the tiered keyword
+      filter (Tier 1 unconditional, Tier 2 requires |VADER compound| ≥ 0.4).
+    - Hard cap of MAX_DAILY_ALERTS per calendar day (resets at midnight MYT).
     """
-    global _seen_links, _breaking_initialized
+    global _seen_links, _breaking_initialized, _daily_alert_count, _daily_alert_date
+
+    # Reset daily counter at midnight MYT
+    tz    = pytz.timezone(TIMEZONE)
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    if today != _daily_alert_date:
+        _daily_alert_date  = today
+        _daily_alert_count = 0
 
     breaking_stories: dict = {}   # category_key -> [story, ...]
 
@@ -404,8 +435,8 @@ async def check_breaking_news(app: Application) -> None:
         for s in stories:
             if s["raw_link"]:
                 _seen_links.add(s["raw_link"])
-        # Filter to only genuinely newsworthy stories
-        hot = [s for s in new if is_breaking(s["raw_title"])]
+        # Tiered filter: pass raw compound so Tier 2 words are gated by sentiment
+        hot = [s for s in new if is_breaking(s["raw_title"], s.get("compound", 0.0))]
         if hot:
             breaking_stories[key] = hot
 
@@ -417,14 +448,31 @@ async def check_breaking_news(app: Application) -> None:
     if not breaking_stories:
         return
 
-    total = sum(len(v) for v in breaking_stories.values())
-    logger.info("Breaking news: %d story/stories to push.", total)
+    # Enforce daily cap — trim stories to remaining quota
+    remaining = MAX_DAILY_ALERTS - _daily_alert_count
+    if remaining <= 0:
+        logger.info("Daily alert cap (%d) reached — suppressing %d story/stories.",
+                    MAX_DAILY_ALERTS, sum(len(v) for v in breaking_stories.values()))
+        return
+
+    capped: dict = {}
+    for key, stories in breaking_stories.items():
+        if remaining <= 0:
+            break
+        take = stories[:remaining]
+        capped[key] = take
+        remaining  -= len(take)
+
+    total = sum(len(v) for v in capped.values())
+    _daily_alert_count += total
+    logger.info("Breaking news: pushing %d story/stories (daily total: %d/%d).",
+                total, _daily_alert_count, MAX_DAILY_ALERTS)
 
     await push(
         app.bot, CHAT_ID,
         f"🚨 <b>Breaking News</b> — {total} new alert{'s' if total > 1 else ''}",
     )
-    for key, stories in breaking_stories.items():
+    for key, stories in capped.items():
         cat   = CATEGORIES[key]
         lines = [f"{cat['emoji']} <b>{cat['title']}</b>", ""]
         for s in stories[:3]:
@@ -438,7 +486,7 @@ async def check_breaking_news(app: Application) -> None:
         await asyncio.sleep(0.3)
 
 
-# ── Boot ────────────────────────────────────────────────────────────────────────────────────
+# ── Boot ───────────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
