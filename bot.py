@@ -370,9 +370,14 @@ def get_market_snapshot() -> str:
 
     for label, ticker, fmt, unit in MARKET_TICKERS:
         try:
-            fi    = yf.Ticker(ticker).fast_info
-            price = fi.last_price
-            prev  = fi.previous_close
+            # fast_info.last_price is unreliable for non-US tickers in yfinance 0.2.x
+            # (returns None → JSON parse error). history() works for all ticker types.
+            hist = yf.Ticker(ticker).history(period="5d")
+            if hist.empty or len(hist) < 2:
+                lines.append(f"⚪ <b>{label}</b>: N/A")
+                continue
+            price = float(hist["Close"].iloc[-1])
+            prev  = float(hist["Close"].iloc[-2])
             if price and prev and prev != 0:
                 pct   = ((price - prev) / prev) * 100
                 arrow = "🟢" if pct >= 0 else "🔴"
