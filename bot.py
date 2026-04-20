@@ -100,9 +100,6 @@ CATEGORIES = {
             ("FMT News",    "https://www.freemalaysiatoday.com/feed/"),
             ("The Star",    "https://www.thestar.com.my/rss/Business/"),
         ],
-        # Only keep stories that mention at least one of these terms —
-        # prevents US/global news published by Malaysian outlets from
-        # appearing under the Malaysian category.
         "geo_keywords": {
             "malaysia", "malaysian", "kuala lumpur", "klci", "ringgit",
             "bursa", "putrajaya", "sabah", "sarawak", "penang", "johor",
@@ -112,6 +109,7 @@ CATEGORIES = {
             "bank negara", "sc malaysia", "idrisi", "iskandar",
             "1malaysia", "mida", "mdec", "mycert",
         },
+        "english_only": True,
     },
 }
 
@@ -142,9 +140,19 @@ _daily_alert_date: str     = ""
 
 # ── Personalisation: weights ───────────────────────────────────────────────────
 LIKE_WEIGHT    = 1.0
-DISLIKE_WEIGHT = 3.0    # dislikes carry 3× more weight — likes are extraordinary
-MIN_RATINGS    = 5      # minimum ratings before personalisation kicks in
-STORY_CACHE_MAX = 200   # remember last N stories for rating lookup
+DISLIKE_WEIGHT = 3.0
+MIN_RATINGS    = 5
+STORY_CACHE_MAX = 200
+
+# Common Malay function words that never appear in standard English.
+MALAY_INDICATORS = {
+    "yang", "kepada", "bahawa", "kerana", "daripada", "tidak", "akan",
+    "telah", "dengan", "untuk", "bagi", "apabila", "seperti", "antara",
+    "lebih", "boleh", "dalam", "rakyat", "kerajaan", "perdana", "menteri",
+    "perikatan", "nasional", "parti", "ahli", "parlimen", "dewan",
+    "berkata", "semua", "mereka", "adalah", "jika", "hanya",
+    "satu", "dua", "tiga", "empat", "lima",
+}
 
 STOP_WORDS = {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -163,11 +171,11 @@ STOP_WORDS = {
 
 def _default_prefs() -> dict:
     return {
-        "keywords":     {},   # word -> cumulative score (+ liked, - disliked)
-        "sources":      {},   # source.lower() -> cumulative score
-        "categories":   {},   # category key -> cumulative score
+        "keywords":     {},
+        "sources":      {},
+        "categories":   {},
         "total_ratings": 0,
-        "story_cache":  {},   # hash8 -> {title, source, category}
+        "story_cache":  {},
         "last_updated": "",
     }
 
@@ -193,18 +201,15 @@ def save_prefs(prefs: dict) -> None:
 # ── Preference Logic ───────────────────────────────────────────────────────────
 
 def extract_keywords(title: str) -> list:
-    """Extract meaningful words from a headline (no stop-words, len ≥ 4)."""
     words = re.sub(r"[^a-z ]", " ", title.lower()).split()
     return [w for w in words if w not in STOP_WORDS and len(w) >= 4]
 
 
 def story_hash(title: str) -> str:
-    """8-char MD5 prefix to identify a story."""
     return hashlib.md5(title.encode()).hexdigest()[:8]
 
 
 def score_story(raw_title: str, source: str, category: str, prefs: dict) -> float:
-    """Score a story against learned preferences. Higher = more relevant."""
     if prefs.get("total_ratings", 0) < MIN_RATINGS:
         return 0.0
     score = 0.0
@@ -216,7 +221,6 @@ def score_story(raw_title: str, source: str, category: str, prefs: dict) -> floa
 
 
 def rank_stories(stories: list, category: str, prefs: dict) -> list:
-    """Re-rank stories by preference score (ties broken by original order)."""
     if prefs.get("total_ratings", 0) < MIN_RATINGS:
         return stories
     scored = [
@@ -228,7 +232,6 @@ def rank_stories(stories: list, category: str, prefs: dict) -> list:
 
 
 def cache_stories(stories: list, category: str, prefs: dict) -> None:
-    """Add stories to the prefs cache so they can be looked up when rated."""
     cache = prefs.setdefault("story_cache", {})
     for s in stories:
         h = story_hash(s["raw_title"])
@@ -237,28 +240,18 @@ def cache_stories(stories: list, category: str, prefs: dict) -> None:
             "source":   s["source"],
             "category": category,
         }
-    # Trim to last STORY_CACHE_MAX entries
     if len(cache) > STORY_CACHE_MAX:
         for old_key in list(cache.keys())[:-STORY_CACHE_MAX]:
             del cache[old_key]
 
 
 def record_rating(title: str, source: str, category: str, vote: str, prefs: dict) -> None:
-    """
-    Update preference weights from a single rating.
-    like   → +LIKE_WEIGHT    (reserved for truly extraordinary stories)
-    dislike → -DISLIKE_WEIGHT (3× stronger — dislikes dominate personalisation)
-    """
     sign = LIKE_WEIGHT if vote == "like" else -DISLIKE_WEIGHT
     for kw in extract_keywords(title):
         prefs["keywords"][kw] = round(prefs["keywords"].get(kw, 0.0) + sign, 2)
     src = source.lower()
-    prefs["sources"][src] = round(
-        prefs["sources"].get(src, 0.0) + sign * 0.5, 2
-    )
-    prefs["categories"][category] = round(
-        prefs["categories"].get(category, 0.0) + sign * 0.3, 2
-    )
+    prefs["sources"][src] = round(prefs["sources"].get(src, 0.0) + sign * 0.5, 2)
+    prefs["categories"][category] = round(prefs["categories"].get(category, 0.0) + sign * 0.3, 2)
     prefs["total_ratings"] = prefs.get("total_ratings", 0) + 1
     prefs["last_updated"] = datetime.now(pytz.timezone(TIMEZONE)).isoformat()
 
@@ -266,12 +259,6 @@ def record_rating(title: str, source: str, category: str, vote: str, prefs: dict
 # ── Inline Rating Keyboard ─────────────────────────────────────────────────────
 
 def build_rating_keyboard(stories: list) -> InlineKeyboardMarkup:
-    """
-    Compact 👍/👎 keyboard — 3 stories per row, labelled by their position number.
-    e.g. for 5 stories:
-      [1️⃣👍][1️⃣👎]  [2️⃣👍][2️⃣👎]  [3️⃣👍][3️⃣👎]
-      [4️⃣👍][4️⃣👎]  [5️⃣👍][5️⃣👎]
-    """
     rows: list = []
     row:  list = []
     for i, s in enumerate(stories):
@@ -279,7 +266,7 @@ def build_rating_keyboard(stories: list) -> InlineKeyboardMarkup:
         num = NUM_EMOJI[i] if i < len(NUM_EMOJI) else f"{i + 1}"
         row.append(InlineKeyboardButton(f"{num}👍", callback_data=f"r:like:{h}"))
         row.append(InlineKeyboardButton(f"{num}👎", callback_data=f"r:dislike:{h}"))
-        if len(row) >= 6:   # 6 buttons = 3 stories per row
+        if len(row) >= 6:
             rows.append(row)
             row = []
     if row:
@@ -308,9 +295,7 @@ def is_breaking(title: str, compound: float = 0.0) -> bool:
     t_lower = title.lower()
     if words & BREAKING_TIER1:
         return True
-    has_t2 = bool(words & BREAKING_TIER2_WORDS) or any(
-        p in t_lower for p in BREAKING_TIER2_PHRASES
-    )
+    has_t2 = bool(words & BREAKING_TIER2_WORDS) or any(p in t_lower for p in BREAKING_TIER2_PHRASES)
     return has_t2 and abs(compound) >= 0.4
 
 
@@ -320,12 +305,6 @@ _punct_re = re.compile(r"[^\w\s]")
 
 
 def _make_dedup_key(title: str) -> str:
-    """
-    Robust dedup key: strip punctuation, lowercase, keep first 8 non-trivial
-    words.  Catches duplicate stories whose titles differ only in punctuation,
-    articles, or minor wording at the tail (e.g. "U.S." vs "US", trailing
-    source attribution added by some feeds).
-    """
     clean = _punct_re.sub("", title.lower())
     words = [w for w in clean.split() if len(w) > 2][:8]
     return " ".join(words)
@@ -335,6 +314,7 @@ def fetch_stories(
     feeds: list,
     limit: int = MAX_STORIES,
     geo_keywords: set | None = None,
+    english_only: bool = False,
 ) -> list:
     all_stories: list  = []
     seen_titles: set   = set()
@@ -348,12 +328,17 @@ def fetch_stories(
                 if not title:
                     continue
 
+                # ── Language filter ────────────────────────────────────────
+                if english_only:
+                    title_words = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
+                    if title_words & MALAY_INDICATORS:
+                        continue
+
                 # ── Deduplication ──────────────────────────────────────────
                 dedup_key = _make_dedup_key(title)
                 if dedup_key in seen_titles:
                     continue
 
-                # Secondary URL-based dedup (same article, different title)
                 link     = entry.get("link", "")
                 link_key = link.split("?")[0].rstrip("/") if link else ""
                 if link_key and link_key in seen_links:
@@ -373,9 +358,6 @@ def fetch_stories(
                 summary = clean_summary(raw)
 
                 # ── Geographic filter ──────────────────────────────────────
-                # If the category declares geo_keywords, skip stories that
-                # contain none of them — prevents international news from
-                # slipping into region-specific categories.
                 if geo_keywords:
                     haystack = (title + " " + strip_html(raw)).lower()
                     if not any(kw in haystack for kw in geo_keywords):
@@ -422,9 +404,7 @@ def get_market_snapshot() -> str:
 
     for label, ticker, fmt, unit in MARKET_TICKERS:
         try:
-            # fast_info.last_price is unreliable for non-US tickers in yfinance 0.2.x
-            # (returns None → JSON parse error). history() works for all ticker types.
-            hist = yf.Ticker(ticker).history(period="5d")
+            hist = yf.Ticker(ticker).history(period="1mo")
             if hist.empty or len(hist) < 2:
                 lines.append(f"⚪ <b>{label}</b>: N/A")
                 continue
@@ -449,14 +429,10 @@ def get_market_snapshot() -> str:
 # ── Message Building ───────────────────────────────────────────────────────────
 
 def build_message(category_key: str, prefs: dict) -> tuple:
-    """
-    Returns (text, keyboard) where keyboard is an InlineKeyboardMarkup
-    with 👍/👎 buttons for each story, or None if no stories.
-    Stories are re-ranked by preference score if enough ratings exist.
-    """
     cat          = CATEGORIES[category_key]
     geo_keywords = cat.get("geo_keywords")
-    stories      = fetch_stories(cat["feeds"], geo_keywords=geo_keywords)
+    english_only = cat.get("english_only", False)
+    stories      = fetch_stories(cat["feeds"], geo_keywords=geo_keywords, english_only=english_only)
     stories      = rank_stories(stories, category_key, prefs)
     cache_stories(stories, category_key, prefs)
 
@@ -470,7 +446,6 @@ def build_message(category_key: str, prefs: dict) -> tuple:
         )
         return text, None
 
-    # Personalisation status hint
     total = prefs.get("total_ratings", 0)
     if total < MIN_RATINGS:
         remaining = MIN_RATINGS - total
@@ -509,7 +484,6 @@ async def push(
     bot, chat_id: str, text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """Send a message, attaching the keyboard to the final chunk."""
     if len(text) <= MAX_MSG_LEN:
         await bot.send_message(
             chat_id=chat_id, text=text,
@@ -519,8 +493,8 @@ async def push(
         return
     cut = text[:MAX_MSG_LEN].rfind("\n\n")
     cut = cut if cut > 0 else MAX_MSG_LEN
-    await push(bot, chat_id, text[:cut].strip())                 # no keyboard on intermediate chunks
-    await push(bot, chat_id, text[cut:].strip(), reply_markup)   # keyboard on last chunk
+    await push(bot, chat_id, text[:cut].strip())
+    await push(bot, chat_id, text[cut:].strip(), reply_markup)
 
 
 async def deliver(bot, chat_id: str, category_key: str, prefs: dict) -> None:
@@ -531,12 +505,8 @@ async def deliver(bot, chat_id: str, category_key: str, prefs: dict) -> None:
 # ── Rating Callback Handler ────────────────────────────────────────────────────
 
 async def handle_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles 👍/👎 button presses.
-    callback_data format: "r:{like|dislike}:{hash8}"
-    """
     query = update.callback_query
-    await query.answer()   # dismiss the loading spinner immediately
+    await query.answer()
 
     parts = (query.data or "").split(":")
     if len(parts) != 3 or parts[0] != "r":
@@ -637,11 +607,6 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def build_all_message(prefs: dict) -> tuple:
-    """
-    Single consolidated /all digest.
-    Shows 1 story per category until MIN_RATINGS reached, then 2.
-    Returns (text, keyboard) — keyboard covers every shown story.
-    """
     tz    = pytz.timezone(TIMEZONE)
     date  = datetime.now(tz).strftime("%A, %d %B %Y")
     total = prefs.get("total_ratings", 0)
@@ -657,7 +622,7 @@ def build_all_message(prefs: dict) -> tuple:
         pref_hint = "\n<i>🎯 Personalised for you</i>"
 
     lines: list       = [f"🌅 <b>Top Headlines — {date}</b>", ""]
-    all_stories: list = []   # flat list — drives keyboard numbering
+    all_stories: list = []
 
     for key, cat in CATEGORIES.items():
         stories = fetch_stories(cat["feeds"])
@@ -710,7 +675,6 @@ async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_myprofile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the user's learned preference profile."""
     prefs = load_prefs()
     total = prefs.get("total_ratings", 0)
 
@@ -723,15 +687,8 @@ async def cmd_myprofile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     def top_items(d: dict, n: int = 5) -> tuple:
-        """Returns (top_positive, top_negative) by absolute value."""
-        positive = sorted(
-            [(k, v) for k, v in d.items() if v > 0],
-            key=lambda x: x[1], reverse=True
-        )[:n]
-        negative = sorted(
-            [(k, v) for k, v in d.items() if v < 0],
-            key=lambda x: x[1]
-        )[:n]
+        positive = sorted([(k, v) for k, v in d.items() if v > 0], key=lambda x: x[1], reverse=True)[:n]
+        negative = sorted([(k, v) for k, v in d.items() if v < 0], key=lambda x: x[1])[:n]
         return positive, negative
 
     liked_kw, disliked_kw   = top_items(prefs.get("keywords", {}))
@@ -744,12 +701,7 @@ async def cmd_myprofile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else f"⏳ <b>Learning…</b> {MIN_RATINGS - total} more rating(s) to unlock personalisation ({total}/{MIN_RATINGS})"
     )
 
-    lines = [
-        "🧠 <b>Your Preference Profile</b>",
-        "",
-        status,
-        "",
-    ]
+    lines = ["🧠 <b>Your Preference Profile</b>", "", status, ""]
 
     if liked_kw:
         lines.append("✅ <b>Topics you like:</b>")
@@ -815,10 +767,6 @@ async def daily_digest(app: Application) -> None:
 # ── Scheduled: Breaking News every 30 min ─────────────────────────────────────
 
 async def check_breaking_news(app: Application) -> None:
-    """
-    Tiered keyword filter + sentiment gate + daily cap.
-    Breaking stories also get 👍/👎 buttons so you can rate them.
-    """
     global _seen_links, _breaking_initialized, _daily_alert_count, _daily_alert_date
 
     tz    = pytz.timezone(TIMEZONE)
@@ -859,7 +807,7 @@ async def check_breaking_news(app: Application) -> None:
     for key, stories in breaking_stories.items():
         if remaining <= 0:
             break
-        take       = stories[:remaining]
+        take        = stories[:remaining]
         capped[key] = take
         remaining  -= len(take)
 
@@ -924,7 +872,6 @@ def main() -> None:
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
-    # Rating button handler — must match pattern "r:like:*" / "r:dislike:*"
     app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^r:(like|dislike):[0-9a-f]{8}$"))
 
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
