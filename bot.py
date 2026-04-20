@@ -100,6 +100,18 @@ CATEGORIES = {
             ("FMT News",    "https://www.freemalaysiatoday.com/feed/"),
             ("The Star",    "https://www.thestar.com.my/rss/Business/"),
         ],
+        # Only keep stories that mention at least one of these terms —
+        # prevents US/global news published by Malaysian outlets from
+        # appearing under the Malaysian category.
+        "geo_keywords": {
+            "malaysia", "malaysian", "kuala lumpur", "klci", "ringgit",
+            "bursa", "putrajaya", "sabah", "sarawak", "penang", "johor",
+            "perak", "selangor", "petaling jaya", "myr", "kl ",
+            "mahathir", "anwar ibrahim", "najib", "umno", "pakatan",
+            "petronas", "khazanah", "tabung haji", "epf", "kwsp",
+            "bank negara", "sc malaysia", "idrisi", "iskandar",
+            "1malaysia", "mida", "mdec", "mycert",
+        },
     },
 }
 
@@ -304,9 +316,29 @@ def is_breaking(title: str, compound: float = 0.0) -> bool:
 
 # ── Feed Fetching ──────────────────────────────────────────────────────────────
 
-def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
-    all_stories: list = []
-    seen: set         = set()
+_punct_re = re.compile(r"[^\w\s]")
+
+
+def _make_dedup_key(title: str) -> str:
+    """
+    Robust dedup key: strip punctuation, lowercase, keep first 8 non-trivial
+    words.  Catches duplicate stories whose titles differ only in punctuation,
+    articles, or minor wording at the tail (e.g. "U.S." vs "US", trailing
+    source attribution added by some feeds).
+    """
+    clean = _punct_re.sub("", title.lower())
+    words = [w for w in clean.split() if len(w) > 2][:8]
+    return " ".join(words)
+
+
+def fetch_stories(
+    feeds: list,
+    limit: int = MAX_STORIES,
+    geo_keywords: set | None = None,
+) -> list:
+    all_stories: list  = []
+    seen_titles: set   = set()
+    seen_links:  set   = set()
 
     for source, url in feeds:
         try:
@@ -315,10 +347,21 @@ def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
                 title = strip_html(entry.get("title", "")).strip()
                 if not title:
                     continue
-                dedup_key = title.lower()[:60]
-                if dedup_key in seen:
+
+                # ── Deduplication ──────────────────────────────────────────
+                dedup_key = _make_dedup_key(title)
+                if dedup_key in seen_titles:
                     continue
-                seen.add(dedup_key)
+
+                # Secondary URL-based dedup (same article, different title)
+                link     = entry.get("link", "")
+                link_key = link.split("?")[0].rstrip("/") if link else ""
+                if link_key and link_key in seen_links:
+                    continue
+
+                seen_titles.add(dedup_key)
+                if link_key:
+                    seen_links.add(link_key)
 
                 raw = ""
                 content = entry.get("content")
@@ -327,8 +370,17 @@ def fetch_stories(feeds: list, limit: int = MAX_STORIES) -> list:
                 if not raw or len(strip_html(raw)) < 60:
                     raw = entry.get("summary") or entry.get("description") or ""
 
-                summary  = clean_summary(raw)
-                link     = entry.get("link", "")
+                summary = clean_summary(raw)
+
+                # ── Geographic filter ──────────────────────────────────────
+                # If the category declares geo_keywords, skip stories that
+                # contain none of them — prevents international news from
+                # slipping into region-specific categories.
+                if geo_keywords:
+                    haystack = (title + " " + strip_html(raw)).lower()
+                    if not any(kw in haystack for kw in geo_keywords):
+                        continue
+
                 compound = _sia.polarity_scores(title + " " + summary)["compound"]
                 sentiment = (
                     "📈" if compound >= 0.05 else
@@ -402,9 +454,10 @@ def build_message(category_key: str, prefs: dict) -> tuple:
     with 👍/👎 buttons for each story, or None if no stories.
     Stories are re-ranked by preference score if enough ratings exist.
     """
-    cat     = CATEGORIES[category_key]
-    stories = fetch_stories(cat["feeds"])
-    stories = rank_stories(stories, category_key, prefs)
+    cat          = CATEGORIES[category_key]
+    geo_keywords = cat.get("geo_keywords")
+    stories      = fetch_stories(cat["feeds"], geo_keywords=geo_keywords)
+    stories      = rank_stories(stories, category_key, prefs)
     cache_stories(stories, category_key, prefs)
 
     tz   = pytz.timezone(TIMEZONE)
