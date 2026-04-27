@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Daily News Digest Bot v2.1
+Daily News Digest Bot v2.2
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-What's new in v2.1:
-  - 👍/👎 inline rating buttons on every digest & breaking alert
-  - Preference engine: keyword + source + category scoring
-  - Dislike weight = 3× like weight (you only like the extraordinary)
-  - Persistent prefs: /data/preferences.json on Railway Volume
-  - /myprofile: see what the bot has learned about you
-  - Personalisation kicks in after 5 ratings
+v2.2 changes:
+  - Single consolidated daily digest message (one-liners + category tags)
+  - Market snapshot moved to 10:00 AM (separate from digest)
+  - Market data via Stooq (yfinance dropped — Yahoo rate-limits cloud IPs)
+  - Breaking alerts capped at 1/day
 Commands: /all /world /business /fintech /tech /malaysia /market /myprofile /help
 """
 
@@ -19,12 +17,13 @@ import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import feedparser
 import pytz
-import yfinance as yf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import (
     BotCommand,
@@ -130,21 +129,20 @@ BREAKING_TIER2_WORDS = {
     "resign", "fired", "arrest", "sanction",
 }
 BREAKING_TIER2_PHRASES = {"rate cut", "rate hike"}
-MAX_DAILY_ALERTS = 5
+MAX_DAILY_ALERTS = 1
 
 # ── Breaking News State ────────────────────────────────────────────────────────
-_seen_links: set           = set()
+_seen_links: set            = set()
 _breaking_initialized: bool = False
-_daily_alert_count: int    = 0
-_daily_alert_date: str     = ""
+_daily_alert_count: int     = 0
+_daily_alert_date: str      = ""
 
 # ── Personalisation: weights ───────────────────────────────────────────────────
-LIKE_WEIGHT    = 1.0
-DISLIKE_WEIGHT = 3.0
-MIN_RATINGS    = 5
+LIKE_WEIGHT     = 1.0
+DISLIKE_WEIGHT  = 3.0
+MIN_RATINGS     = 5
 STORY_CACHE_MAX = 200
 
-# Common Malay function words that never appear in standard English.
 MALAY_INDICATORS = {
     "yang", "kepada", "bahawa", "kerana", "daripada", "tidak", "akan",
     "telah", "dengan", "untuk", "bagi", "apabila", "seperti", "antara",
@@ -163,7 +161,7 @@ STOP_WORDS = {
     "they", "as", "up", "out", "about", "into", "over", "after",
     "says", "said", "report", "reports", "according", "amid", "just",
     "than", "more", "also", "since", "two", "three", "four", "five",
-    "six", "seven", "eight", "nine", "ten", "amid", "amid",
+    "six", "seven", "eight", "nine", "ten",
 }
 
 
@@ -171,12 +169,12 @@ STOP_WORDS = {
 
 def _default_prefs() -> dict:
     return {
-        "keywords":     {},
-        "sources":      {},
-        "categories":   {},
+        "keywords":      {},
+        "sources":       {},
+        "categories":    {},
         "total_ratings": 0,
-        "story_cache":  {},
-        "last_updated": "",
+        "story_cache":   {},
+        "last_updated":  "",
     }
 
 
@@ -290,6 +288,16 @@ def clean_summary(raw: str, max_chars: int = 280) -> str:
     return summary
 
 
+def one_liner(raw: str, max_chars: int = 140) -> str:
+    text      = strip_html(raw)
+    text      = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'\u201c])", text)
+    line      = sentences[0].strip() if sentences else text
+    if len(line) > max_chars:
+        line = line[:max_chars].rsplit(" ", 1)[0] + "…"
+    return line
+
+
 def is_breaking(title: str, compound: float = 0.0) -> bool:
     words   = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
     t_lower = title.lower()
@@ -316,9 +324,9 @@ def fetch_stories(
     geo_keywords: set | None = None,
     english_only: bool = False,
 ) -> list:
-    all_stories: list  = []
-    seen_titles: set   = set()
-    seen_links:  set   = set()
+    all_stories: list = []
+    seen_titles: set  = set()
+    seen_links:  set  = set()
 
     for source, url in feeds:
         try:
@@ -328,13 +336,11 @@ def fetch_stories(
                 if not title:
                     continue
 
-                # ── Language filter ────────────────────────────────────────
                 if english_only:
                     title_words = set(re.sub(r"[^a-z ]", " ", title.lower()).split())
                     if title_words & MALAY_INDICATORS:
                         continue
 
-                # ── Deduplication ──────────────────────────────────────────
                 dedup_key = _make_dedup_key(title)
                 if dedup_key in seen_titles:
                     continue
@@ -356,8 +362,8 @@ def fetch_stories(
                     raw = entry.get("summary") or entry.get("description") or ""
 
                 summary = clean_summary(raw)
+                oneline = one_liner(raw)
 
-                # ── Geographic filter ──────────────────────────────────────
                 if geo_keywords:
                     haystack = (title + " " + strip_html(raw)).lower()
                     if not any(kw in haystack for kw in geo_keywords):
@@ -374,6 +380,7 @@ def fetch_stories(
                     "source":    source,
                     "title":     html.escape(title),
                     "summary":   html.escape(summary),
+                    "oneline":   html.escape(oneline),
                     "link":      link,
                     "sentiment": sentiment,
                     "compound":  compound,
@@ -389,12 +396,34 @@ def fetch_stories(
 # ── Market Snapshot ────────────────────────────────────────────────────────────
 
 MARKET_TICKERS = [
-    ("🇲🇾 KLCI",   "^KLSE",   "{:,.2f}",  " pts"),
-    ("💵 USD/MYR", "MYR=X",   "{:.4f}",   ""),
-    ("₿  BTC",     "BTC-USD",  "${:,.0f}", ""),
-    ("📈 S&P 500", "^GSPC",   "{:,.2f}",  " pts"),
-    ("🥇 Gold",    "GC=F",    "${:,.2f}", "/oz"),
+    ("🇲🇾 KLCI",   "^klci",   "{:,.2f}",  " pts"),
+    ("💵 USD/MYR", "usdmyr",  "{:.4f}",   ""),
+    ("₿  BTC",     "btcusd",  "${:,.0f}", ""),
+    ("📈 S&P 500", "^spx",    "{:,.2f}",  " pts"),
+    ("🥇 Gold",    "xauusd",  "${:,.2f}", "/oz"),
 ]
+
+
+def _fetch_stooq_quote(symbol: str) -> tuple[float, float] | None:
+    """Stooq lite CSV — free, no auth, no rate limits.
+    Returns (close, open) so we can show intraday % change."""
+    url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            text = resp.read().decode("utf-8")
+        rows = text.strip().splitlines()
+        if len(rows) < 2:
+            return None
+        cols = rows[1].split(",")
+        # Columns: Symbol, Date, Time, Open, High, Low, Close, Volume
+        if len(cols) < 7 or "N/D" in cols[3:7]:
+            return None
+        open_p = float(cols[3])
+        close  = float(cols[6])
+        return close, open_p
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, IndexError) as exc:
+        logger.warning("Stooq [%s]: %s", symbol, exc)
+        return None
 
 
 def get_market_snapshot() -> str:
@@ -403,30 +432,39 @@ def get_market_snapshot() -> str:
     lines = [f"📊 <b>MARKET SNAPSHOT</b>", f"🕐 {time}", ""]
 
     for label, ticker, fmt, unit in MARKET_TICKERS:
-        try:
-            hist = yf.Ticker(ticker).history(period="1mo")
-            if hist.empty or len(hist) < 2:
-                lines.append(f"⚪ <b>{label}</b>: N/A")
-                continue
-            price = float(hist["Close"].iloc[-1])
-            prev  = float(hist["Close"].iloc[-2])
-            if price and prev and prev != 0:
-                pct   = ((price - prev) / prev) * 100
-                arrow = "🟢" if pct >= 0 else "🔴"
-                lines.append(
-                    f"{arrow} <b>{label}</b>: {fmt.format(price)}{unit}"
-                    f"  <i>({pct:+.2f}%)</i>"
-                )
-            else:
-                lines.append(f"⚪ <b>{label}</b>: N/A")
-        except Exception as exc:
-            logger.warning("Market [%s]: %s", ticker, exc)
-            lines.append(f"⚪ <b>{label}</b>: N/A")
+        quote = _fetch_stooq_quote(ticker)
+        if quote is None:
+            lines.append(f"⚪ <b>{label}</b>: data unavailable")
+            continue
+        price, prev = quote
+        if prev == 0:
+            lines.append(f"⚪ <b>{label}</b>: {fmt.format(price)}{unit}")
+            continue
+        pct   = ((price - prev) / prev) * 100
+        arrow = "🟢" if pct >= 0 else "🔴"
+        lines.append(
+            f"{arrow} <b>{label}</b>: {fmt.format(price)}{unit}"
+            f"  <i>({pct:+.2f}%)</i>"
+        )
 
     return "\n".join(lines)
 
 
 # ── Message Building ───────────────────────────────────────────────────────────
+
+def _format_story_block(idx: int, key: str, cat: dict, s: dict) -> str:
+    num   = NUM_EMOJI[idx] if idx < len(NUM_EMOJI) else f"{idx + 1}."
+    tag   = f"{cat['emoji']} <b>[{key.upper()}]</b>"
+    desc  = s.get("oneline") or s.get("summary") or ""
+    block = f"{num} {tag} {s['sentiment']} <b>{s['title']}</b>"
+    if desc:
+        block += f"\n<i>{desc}</i>"
+    meta = s["source"]
+    if s["link"]:
+        meta += f' · <a href="{s["link"]}">Read →</a>'
+    block += f"\n<i>{meta}</i>"
+    return block
+
 
 def build_message(category_key: str, prefs: dict) -> tuple:
     cat          = CATEGORIES[category_key]
@@ -454,20 +492,13 @@ def build_message(category_key: str, prefs: dict) -> tuple:
         pref_hint = "\n<i>🎯 Personalised for you</i>"
 
     lines = [
-        f"{cat['emoji']} <b>{cat['title']}</b>",
-        f"📅 {date}",
+        f"{cat['emoji']} <b>{cat['title']}</b> — {date}",
         "━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
     for i, s in enumerate(stories):
-        num   = NUM_EMOJI[i] if i < len(NUM_EMOJI) else f"{i + 1}."
-        block = f"{s['sentiment']} {num} <b>{s['title']}</b>\n<i>{s['source']}</i>"
-        if s["summary"]:
-            block += f" — {s['summary']}"
-        if s["link"]:
-            block += f'\n<a href="{s["link"]}">Read more →</a>'
-        lines.append(block)
+        lines.append(_format_story_block(i, category_key, cat, s))
         lines.append("")
 
     lines.append(pref_hint)
@@ -539,11 +570,11 @@ async def handle_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Command Handlers ───────────────────────────────────────────────────────────
 
 HELP_TEXT = (
-    "👋 <b>Daily News Digest Bot v2.1</b>\n\n"
-    "Auto-digest at <b>8:00 AM MYT</b> · Breaking alerts every 30 min\n"
+    "👋 <b>Daily News Digest Bot v2.2</b>\n\n"
+    "Daily digest <b>8:00 AM</b> · Market snapshot <b>10:00 AM</b> · 1 breaking alert/day max\n"
     "Rate stories with 👍/👎 buttons to personalise your feed.\n\n"
     "📌 <b>Commands:</b>\n"
-    "/all       — 📰 Full digest + market\n"
+    "/all       — 📰 Full digest\n"
     "/world     — 🌍 World News\n"
     "/business  — 💼 Business News\n"
     "/fintech   — 💳 Fintech &amp; Crypto\n"
@@ -621,32 +652,25 @@ def build_all_message(prefs: dict) -> tuple:
     else:
         pref_hint = "\n<i>🎯 Personalised for you</i>"
 
-    lines: list       = [f"🌅 <b>Top Headlines — {date}</b>", ""]
+    lines: list       = [
+        f"🌅 <b>Daily Digest — {date}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
     all_stories: list = []
+    tagged: list      = []
 
     for key, cat in CATEGORIES.items():
         stories = fetch_stories(cat["feeds"])
         stories = rank_stories(stories, key, prefs)
         cache_stories(stories, key, prefs)
-        top = stories[:n]
-        if not top:
-            continue
+        for s in stories[:n]:
+            tagged.append((key, cat, s))
 
-        lines.append(f"{cat['emoji']} <b>{cat['title']}</b>")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-
-        for s in top:
-            idx = len(all_stories)
-            num = NUM_EMOJI[idx] if idx < len(NUM_EMOJI) else f"{idx + 1}."
-            block = f"{s['sentiment']} {num} <b>{s['title']}</b>\n<i>{s['source']}</i>"
-            if s["summary"]:
-                block += f" — {s['summary']}"
-            if s["link"]:
-                block += f'\n<a href="{s["link"]}">Read more →</a>'
-            lines.append(block)
-            all_stories.append(s)
-
+    for idx, (key, cat, s) in enumerate(tagged):
+        lines.append(_format_story_block(idx, key, cat, s))
         lines.append("")
+        all_stories.append(s)
 
     if not all_stories:
         return "⚠️ No stories available right now. Try again shortly.", None
@@ -740,31 +764,25 @@ async def cmd_myprofile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_html("\n".join(lines))
 
 
-# ── Scheduled: Daily Digest at 8 AM ───────────────────────────────────────────
+# ── Scheduled Jobs ─────────────────────────────────────────────────────────────
 
 async def daily_digest(app: Application) -> None:
     logger.info("Running daily digest…")
-    tz    = pytz.timezone(TIMEZONE)
-    date  = datetime.now(tz).strftime("%A, %d %B %Y")
     prefs = load_prefs()
 
-    await push(app.bot, CHAT_ID, f"🌅 <b>Good Morning, Rodney! Your Daily Digest</b>\n📅 {date}")
+    text, keyboard = build_all_message(prefs)
+    await push(app.bot, CHAT_ID, text, keyboard)
+
+    save_prefs(prefs)
+
+
+async def daily_market(app: Application) -> None:
+    logger.info("Running 10 AM market snapshot…")
     try:
         await push(app.bot, CHAT_ID, get_market_snapshot())
     except Exception as exc:
         logger.error("Market snapshot failed: %s", exc)
 
-    for key in CATEGORIES:
-        try:
-            await deliver(app.bot, CHAT_ID, key, prefs)
-            await asyncio.sleep(1)
-        except Exception as exc:
-            logger.error("Category %s failed: %s", key, exc)
-
-    save_prefs(prefs)
-
-
-# ── Scheduled: Breaking News every 30 min ─────────────────────────────────────
 
 async def check_breaking_news(app: Application) -> None:
     global _seen_links, _breaking_initialized, _daily_alert_count, _daily_alert_date
@@ -775,7 +793,7 @@ async def check_breaking_news(app: Application) -> None:
         _daily_alert_date  = today
         _daily_alert_count = 0
 
-    prefs            = load_prefs()
+    prefs                  = load_prefs()
     breaking_stories: dict = {}
 
     for key, cat in CATEGORIES.items():
@@ -816,24 +834,14 @@ async def check_breaking_news(app: Application) -> None:
     logger.info("Breaking news: %d story/stories (daily total: %d/%d).",
                 total, _daily_alert_count, MAX_DAILY_ALERTS)
 
-    await push(
-        app.bot, CHAT_ID,
-        f"🚨 <b>Breaking News</b> — {total} new alert{'s' if total > 1 else ''}",
-    )
-    for key, stories in capped.items():
-        cat   = CATEGORIES[key]
-        lines = [f"{cat['emoji']} <b>{cat['title']}</b>", ""]
-        for s in stories[:3]:
-            block = f"{s['sentiment']} <b>{s['title']}</b>\n<i>{s['source']}</i>"
-            if s["summary"]:
-                block += f" — {s['summary']}"
-            if s["link"]:
-                block += f'\n<a href="{s["link"]}">Read more →</a>'
-            lines.extend([block, ""])
-        lines.append("<i>Rate these alerts 👇</i>")
-        keyboard = build_rating_keyboard(stories[:3])
-        await push(app.bot, CHAT_ID, "\n".join(lines).strip(), keyboard)
-        await asyncio.sleep(0.3)
+    flat = [(k, CATEGORIES[k], s) for k, stories in capped.items() for s in stories]
+    lines = [f"🚨 <b>Breaking News</b>", "━━━━━━━━━━━━━━━━━━━━━", ""]
+    for idx, (k, cat, s) in enumerate(flat):
+        lines.append(_format_story_block(idx, k, cat, s))
+        lines.append("")
+    lines.append("<i>Rate this alert 👇</i>")
+    keyboard = build_rating_keyboard([s for _, _, s in flat])
+    await push(app.bot, CHAT_ID, "\n".join(lines).strip(), keyboard)
 
     save_prefs(prefs)
 
@@ -842,7 +850,7 @@ async def check_breaking_news(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("all",       "📰 Full digest + market"),
+        BotCommand("all",       "📰 Full digest"),
         BotCommand("world",     "🌍 World News"),
         BotCommand("business",  "💼 Business News"),
         BotCommand("fintech",   "💳 Fintech & Crypto"),
@@ -875,11 +883,12 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^r:(like|dislike):[0-9a-f]{8}$"))
 
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    scheduler.add_job(daily_digest,        "cron",     hour=8, minute=0,  args=[app])
+    scheduler.add_job(daily_digest,        "cron",     hour=8,  minute=0, args=[app])
+    scheduler.add_job(daily_market,        "cron",     hour=10, minute=0, args=[app])
     scheduler.add_job(check_breaking_news, "interval", minutes=30,        args=[app])
     scheduler.start()
 
-    logger.info("Bot v2.1 live — personalisation enabled.")
+    logger.info("Bot v2.2 live — single-message digest + Stooq market data.")
     app.run_polling(drop_pending_updates=True)
 
 
