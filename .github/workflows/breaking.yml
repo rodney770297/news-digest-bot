@@ -1,0 +1,47 @@
+name: Breaking News
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+# Prevent overlapping runs (cron drift can stack them)
+concurrency:
+  group: breaking-news
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Restore breaking-news state
+        uses: actions/cache/restore@v4
+        with:
+          path: state/
+          key: breaking-state-${{ github.run_id }}
+          restore-keys: |
+            breaking-state-
+
+      - run: pip install -r requirements.txt
+
+      - name: Run breaking-news check
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.CHAT_ID }}
+          TIMEZONE:  Asia/Kuala_Lumpur
+        run: python send_breaking.py
+
+      - name: Save breaking-news state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state/
+          key: breaking-state-${{ github.run_id }}
